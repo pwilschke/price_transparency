@@ -1,0 +1,12 @@
+.Rproj.user
+*.Rhistory
+.RData
+.Ruserdata
+# raw downloaded MRF content -- large, regenerable from manifest + urls
+data/blobs/
+
+# scratch space
+data/tmp/
+
+# curl ETag cache -- regenerable
+data/etags/

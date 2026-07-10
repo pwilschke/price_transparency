@@ -17,6 +17,8 @@
 # machine with internet; this file only defines the logic.
 
 library(data.table)
+library(arrow)
+library(collapse)
 library(stringr)
 
 # ---- working directory -------------------------------------------------------
@@ -34,26 +36,40 @@ POLITE_SLEEP <- 0.5   # seconds between hospitals, to be a good citizen
 
 # Follow redirects, return final URL + status without downloading the body.
 # Returns list(ok, http_code, final_url, content_type, size).
-curl_head <- function(url) {
+# Try HEAD first (cheap); if it fails, errors out, or the server rejects it
+# (some hospital CDNs return 405/501 or nothing at all for HEAD even though
+# GET works fine), retry with a plain GET.
+curl_head <- function(url, allow_get_fallback = TRUE) {
   fmt <- "%{http_code}\t%{url_effective}\t%{content_type}\t%{size_download}"
-  out <- tryCatch(
-    system2("curl",
-            c("-sIL", "--max-time", TIMEOUT, "-A", shQuote(USER_AGENT),
-              "-o", "/dev/null", "-w", shQuote(fmt), shQuote(url)),
-            stdout = TRUE, stderr = FALSE),
-    error = function(e) character(0)
-  )
-  if (length(out) == 0 || !nzchar(out[1])) {
+  
+  run <- function(method_flag) {
+    out <- tryCatch(
+      system2("curl",
+              c("-sL", method_flag, "--max-time", TIMEOUT, "-A", shQuote(USER_AGENT),
+                "-o", "/dev/null", "-w", shQuote(fmt), shQuote(url)),
+              stdout = TRUE, stderr = FALSE),
+      error = function(e) character(0)
+    )
+    if (length(out) == 0 || !nzchar(out[1])) return(NULL)
+    parts <- str_split(out[length(out)], "\t")[[1]]
+    code  <- suppressWarnings(as.integer(parts[1]))
+    if (is.na(code) || code == 0) return(NULL)
+    list(ok = code >= 200 && code < 400,
+         http_code    = code,
+         final_url    = ifelse(length(parts) >= 2, parts[2], NA_character_),
+         content_type = ifelse(length(parts) >= 3, parts[3], NA_character_),
+         size         = ifelse(length(parts) >= 4, suppressWarnings(as.numeric(parts[4])), NA_real_))
+  }
+  
+  res <- run("-I")  # HEAD
+  if (is.null(res) || res$http_code %in% c(0, 403, 405, 501) ) {
+    if (allow_get_fallback) res <- run(character(0))  # GET fallback
+  }
+  if (is.null(res)) {
     return(list(ok = FALSE, http_code = NA_integer_, final_url = NA_character_,
                 content_type = NA_character_, size = NA_real_))
   }
-  parts <- str_split(out[length(out)], "\t")[[1]]
-  code  <- suppressWarnings(as.integer(parts[1]))
-  list(ok = !is.na(code) && code >= 200 && code < 400,
-       http_code    = code,
-       final_url    = ifelse(length(parts) >= 2, parts[2], NA_character_),
-       content_type = ifelse(length(parts) >= 3, parts[3], NA_character_),
-       size         = ifelse(length(parts) >= 4, suppressWarnings(as.numeric(parts[4])), NA_real_))
+  res
 }
 
 # Follow redirects and return the body as a single string (or NA).
@@ -168,7 +184,7 @@ if (sys.nframe() == 0) {   # only when run as a script, not when sourced
 
   stopifnot("homepage" %in% names(urls))
   # pick a human-readable name column if present, for output readability
-  name_col <- intersect(c("name", "hospital_name", "hospital"), names(urls))[1]
+  name_col <- "organization_name"
 
   N <- 50L   # sample size for the baseline pass; raise once hit rate looks good
   samp <- urls[!is.na(homepage) & homepage != ""][seq_len(min(N, .N))]
