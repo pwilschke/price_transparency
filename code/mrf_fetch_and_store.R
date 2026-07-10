@@ -72,7 +72,44 @@ guess_ext <- function(url) {
   ext
 }
 
-is_precompressed <- function(ext) str_detect(ext, "\\.(gz|zip)$")
+# Detect the true format from the leading bytes of the downloaded file, rather
+# than trusting the URL extension (which lies: .ashx serves a zip, query-only
+# URLs have no extension at all, etc.). Returns one of:
+#   "zip"  -> PK\x03\x04 (and empty/spanned variants)
+#   "gzip" -> \x1f\x8b
+#   "json" -> first non-whitespace char (after any UTF-8 BOM) is { or [
+#   "csv"  -> anything else that has bytes (treated as delimited text)
+#   "unknown" -> empty file
+sniff_format <- function(path) {
+  con   <- file(path, "rb")
+  on.exit(close(con), add = TRUE)
+  magic <- readBin(con, "raw", n = 16L)
+  if (length(magic) == 0) return("unknown")
+  b <- as.integer(magic)
+  if (length(b) >= 4 && b[1] == 0x50 && b[2] == 0x4B &&
+      b[3] %in% c(0x03, 0x05, 0x07)) return("zip")
+  if (length(b) >= 2 && b[1] == 0x1f && b[2] == 0x8b) return("gzip")
+  i <- 1L
+  if (length(b) >= 3 && b[1] == 0xEF && b[2] == 0xBB && b[3] == 0xBF) i <- 4L  # UTF-8 BOM
+  while (i <= length(b) && b[i] %in% c(0x20, 0x09, 0x0A, 0x0D)) i <- i + 1L    # whitespace
+  if (i <= length(b) && b[i] %in% c(0x7B, 0x5B)) return("json")               # { or [
+  "csv"
+}
+
+# A file already in a compressed container gains nothing from our gzip pass
+# (and .ashx-that-is-really-a-zip would otherwise get double-compressed).
+is_compressed_format <- function(fmt) fmt %in% c("zip", "gzip")
+
+# Blob storage extension chosen from the *detected* format, so the filename no
+# longer lies. Falls back to the URL-guessed extension only when we can't tell.
+ext_for_format <- function(fmt, url_ext) {
+  switch(fmt,
+         zip  = ".zip",
+         gzip = ".gz",
+         json = ".json",
+         csv  = ".csv",
+         if (nzchar(url_ext) && url_ext != ".bin") url_ext else ".bin")
+}
 
 blob_path_for_hash <- function(hash, ext) {
   file.path(BLOB_DIR, substr(hash, 1, 2), paste0(hash, ext))
@@ -95,9 +132,11 @@ compress_to_gz <- function(src, dst) {
 # Move a freshly-downloaded tmp file into the blob store under its content
 # hash. If that hash is already stored (same content seen before, from this
 # url or any other), just discard the new copy -- it's a duplicate.
-store_blob <- function(tmp_path, hash, ext) {
-  should_gzip <- !is_precompressed(ext)
-  final_ext   <- if (should_gzip) paste0(ext, ".gz") else ext
+# Gzip only formats that aren't already in a compressed container.
+store_blob <- function(tmp_path, hash, fmt, url_ext) {
+  base_ext    <- ext_for_format(fmt, url_ext)
+  should_gzip <- !is_compressed_format(fmt)
+  final_ext   <- if (should_gzip) paste0(base_ext, ".gz") else base_ext
   dest        <- blob_path_for_hash(hash, final_ext)
   if (file.exists(dest)) return(list(path = dest, newly_stored = FALSE))
   if (!dir.exists(dirname(dest))) dir.create(dirname(dest), recursive = TRUE)
@@ -123,13 +162,15 @@ load_url_hospital_map <- function(results_csv) {
 # ---- step 2: read prior manifest state (latest row per url, if any) ------
 
 load_latest_state <- function() {
-  if (!file.exists(SNAPSHOTS_CSV)) {
-    return(data.table(url = character(), content_hash = character(),
-                       storage_path = character(), bytes_raw = numeric()))
-  }
+  empty <- data.table(url = character(), content_hash = character(),
+                      storage_path = character(), bytes_raw = numeric(),
+                      detected_format = character())
+  if (!file.exists(SNAPSHOTS_CSV)) return(empty)
   hist <- fread(SNAPSHOTS_CSV)
+  # tolerate manifests written before detected_format existed
+  if (!"detected_format" %in% names(hist)) hist[, detected_format := NA_character_]
   setorder(hist, url, run_date)
-  hist[, .SD[.N], by = url][, .(url, content_hash, storage_path, bytes_raw)]
+  hist[, .SD[.N], by = url][, .(url, content_hash, storage_path, bytes_raw, detected_format)]
 }
 
 # ---- step 3: conditional fetch + hash + store for one URL -----------------
@@ -141,7 +182,7 @@ fetch_and_store_one <- function(url, prior) {
   tmp_path <- file.path(TMP_DIR, paste0(key, ext))
   if (file.exists(tmp_path)) unlink(tmp_path)
 
-  fmt <- "%{http_code}\t%{size_download}"
+  fmt <- "%{http_code}\t%{size_download}\t%{content_type}"
   args <- c("-sL", "--max-time", TIMEOUT_SECS, "-A", shQuote(USER_AGENT),
             "--max-filesize", as.character(MAX_MB * 1024 * 1024),
             "--etag-compare", shQuote(etag_path),
@@ -153,13 +194,15 @@ fetch_and_store_one <- function(url, prior) {
     system2("curl", args, stdout = TRUE, stderr = FALSE),
     error = function(e) character(0)
   )
-  parts <- if (length(out) > 0 && nzchar(out[length(out)])) str_split(out[length(out)], "\t")[[1]] else c(NA, NA)
-  http_code <- suppressWarnings(as.integer(parts[1]))
+  parts <- if (length(out) > 0 && nzchar(out[length(out)])) str_split(out[length(out)], "\t")[[1]] else character(0)
+  http_code    <- suppressWarnings(as.integer(parts[1]))
+  content_type <- if (length(parts) >= 3 && nzchar(parts[3])) parts[3] else NA_character_
 
   base_row <- data.table(
     run_date = RUN_DATE, url = url, http_status = http_code,
     outcome = NA_character_, content_hash = NA_character_,
-    storage_path = NA_character_, bytes_raw = NA_real_
+    storage_path = NA_character_, bytes_raw = NA_real_,
+    detected_format = NA_character_, content_type = content_type
   )
 
   # curl aborted due to --max-filesize, or genuinely failed to connect
@@ -173,10 +216,11 @@ fetch_and_store_one <- function(url, prior) {
   if (http_code == 304) {
     unlink(tmp_path)
     if (!is.null(prior)) {
-      base_row$outcome      <- "unchanged"
-      base_row$content_hash <- prior$content_hash
-      base_row$storage_path <- prior$storage_path
-      base_row$bytes_raw    <- prior$bytes_raw
+      base_row$outcome         <- "unchanged"
+      base_row$content_hash    <- prior$content_hash
+      base_row$storage_path    <- prior$storage_path
+      base_row$bytes_raw       <- prior$bytes_raw
+      base_row$detected_format <- prior$detected_format
     } else {
       # 304 but we have no prior record -- shouldn't normally happen; treat as failure
       base_row$outcome <- "unchanged_no_prior_record"
@@ -196,22 +240,25 @@ fetch_and_store_one <- function(url, prior) {
     return(base_row)
   }
 
-  # We have real bytes: hash them.
-  hash  <- sha256_file(tmp_path)
-  bytes <- file.size(tmp_path)
+  # We have real bytes: sniff their true format, then hash them.
+  detected <- sniff_format(tmp_path)
+  hash     <- sha256_file(tmp_path)
+  bytes    <- file.size(tmp_path)
+  base_row$detected_format <- detected
 
   if (!is.null(prior) && identical(prior$content_hash, hash)) {
     # Content identical to what we had, even though server didn't 304 us
     # (some servers don't honor If-None-Match reliably).
-    base_row$outcome      <- "unchanged_by_hash"
-    base_row$content_hash <- hash
-    base_row$storage_path <- prior$storage_path
-    base_row$bytes_raw    <- bytes
+    base_row$outcome         <- "unchanged_by_hash"
+    base_row$content_hash    <- hash
+    base_row$storage_path    <- prior$storage_path
+    base_row$bytes_raw       <- bytes
+    base_row$detected_format <- detected
     unlink(tmp_path)
     return(base_row)
   }
 
-  stored <- store_blob(tmp_path, hash, ext)
+  stored <- store_blob(tmp_path, hash, detected, ext)
   unlink(tmp_path)
 
   base_row$outcome      <- if (is.null(prior)) "new_url" else "updated"
