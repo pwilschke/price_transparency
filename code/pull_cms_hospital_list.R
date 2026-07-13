@@ -1,4 +1,7 @@
-# Pulls a full list of hospitals from CMS
+## This script pulls a full list of hospitals from CMS
+## It also pulls a list of hospitals - crucially including their URLs - 
+## from a dolthub project on price transparency.
+## Currently, the URL dataset gets called further down the line.
 
 library(data.table)
 library(collapse)
@@ -25,9 +28,6 @@ download.file(
   method = "wget"
 )
 
-hosps <- fread("./data/cms_hospitals.csv")
-
-
 hosps_url <- "https://www.dolthub.com/csv/dolthub/standard-charge-files/main/hospitals?include_bom=0"
 
 download.file(
@@ -35,5 +35,3 @@ download.file(
   destfile = "./data/hosp_urls.csv",
   method = "wget"
 )
-
-urls <- fread("./data/hosp_urls.csv")
