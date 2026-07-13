@@ -96,7 +96,7 @@ if (!SKIP_URLS) {
   log_msg("Skipping step 1 (process_urls.R) due to --skip-urls")
 }
 results$fetch   <- run_step("02_mrf_fetch_and_store", "02_mrf_fetch_and_store.R")
-results$process <- run_step("03_process_mrf", "02_process_mrf.R")
+results$process <- run_step("03_process_mrf", "03_process_mrf.R")
 
 log_msg("=== Pipeline run complete: %s ===",
         paste(sprintf("%s=%s", names(results), ifelse(unlist(results), "ok", "FAILED")), collapse = ", "))

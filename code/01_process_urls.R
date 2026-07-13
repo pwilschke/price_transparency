@@ -47,6 +47,12 @@ setwd(find_project_root())
 if (!dir.exists("data"))
   stop("Run from project root (a 'data' dir must exist).")
 
+# Parallelism helpers (detect_workers, with_cluster, par_by_host, ...). Sourcing
+# this file only defines functions; the driver at the bottom is guarded by
+# `if (sys.nframe() == 0)` so parallel workers can source THIS script to get
+# process_one()/curl_head() without kicking off a second full run.
+source(file.path("code", "_parallel_utils.R"))
+
 USER_AGENT <- "price-transparency-research/0.1 (contact: research)"
 TIMEOUT    <- 30      # seconds per request
 POLITE_SLEEP <-
@@ -250,29 +256,36 @@ process_one <- function(homepage, id = NA) {
   base
 }
 
+# Check a single MRF url: HEAD it, return a one-row status data.table.
+check_one_mrf_link <- function(u) {
+  h <- curl_head(u)
+  data.table(
+    url = u,
+    http_code = h$http_code,
+    final_url = h$final_url,
+    content_type = h$content_type,
+    size = h$size,
+    ok = h$ok
+  )
+}
+
 # Validate MRF links found across hospitals: HEAD each one, record status.
-check_mrf_links <- function(results) {
+# Parallelized per-host (concurrent across hosts, POLITE_SLEEP-spaced within a
+# host) when a cluster `cl` is supplied; falls back to serial when cl is NULL.
+check_mrf_links <- function(results, cl = NULL) {
   urls <-
     unique(unlist(str_split(na.omit(results$mrf_urls), " \\| ")))
   urls <- urls[nzchar(urls)]
   if (length(urls) == 0)
     return(data.table())
-  rows <- lapply(urls, function(u) {
-    h <- curl_head(u)
-    Sys.sleep(POLITE_SLEEP)
-    data.table(
-      url = u,
-      http_code = h$http_code,
-      final_url = h$final_url,
-      content_type = h$content_type,
-      size = h$size,
-      ok = h$ok
-    )
-  })
+  rows <- par_by_host(cl, as.list(urls), urls,
+                      function(u) check_one_mrf_link(u), sleep = POLITE_SLEEP)
   rbindlist(rows)
 }
 
 # ---- run over a sample -------------------------------------------------------
+
+if (sys.nframe() == 0) {   # driver: skipped when sourced by a parallel worker
 
 urls <- fread("./data/hosp_urls.csv")
 
@@ -286,7 +299,6 @@ n_env <- Sys.getenv("HPT_SAMPLE_N", unset = NA)
 
 N <- fifelse(is.na(n_env), Inf, as.integer(n_env))
 
-  as.integer(n_env)
 samp <- urls[!is.na(homepage) & homepage != ""]
 samp <- samp[seq_len(min(N, .N))]
 
@@ -306,15 +318,25 @@ message(
 )
 
 homepages <- unique(samp$homepage)
-res_list <- vector("list", length(homepages))
-for (i in seq_along(homepages)) {
-  res_list[[i]] <- process_one(homepages[i], id = i)
-  if (i %% 25 == 0)
-    message(sprintf("...%d / %d homepages checked", i, length(homepages)))
-  Sys.sleep(POLITE_SLEEP)
-}
+
+# Parallelize ACROSS hosts, keep each host serial + politely spaced. Homepages
+# on different hosts are fetched concurrently by separate workers; homepages on
+# the same host go to one worker, which spaces them by POLITE_SLEEP -- so no
+# host ever sees more than one in-flight request. Workers source THIS script
+# (its driver is guarded) to get process_one()/curl_head().
+n_workers <- min(detect_workers(), max(1L, length(homepages)))
+message(sprintf("Checking %d homepages with %d worker(s) (PIPELINE_WORKERS overrides)...",
+                length(homepages), n_workers))
+worker_init <- local({
+  root <- getwd()
+  function() { setwd(root); source(file.path("code", "01_process_urls.R")) }
+})
+res_list <- with_cluster(n_workers, worker_init = worker_init, FUN = function(cl) {
+  par_by_host(cl, as.list(homepages), homepages,
+              function(hp) process_one(hp), sleep = POLITE_SLEEP)
+})
 hp_results <- rbindlist(res_list, fill = TRUE)
-hp_results[, id := NULL]   # this was just this loop's own homepage-index counter, not a hospital id
+hp_results[, id := NULL]   # process_one's id arg is unused now; drop the column
 
 # reattach: one output row per ORIGINAL hospital row (same grain as before),
 # each carrying whichever homepage-level result it maps to. `id` here is
@@ -353,7 +375,12 @@ message(
   )
 )
 
-link_status <- check_mrf_links(results)
+# Same per-host parallel strategy for the link-validation pass.
+n_link_urls <- length(unique(unlist(str_split(na.omit(results$mrf_urls), " \\| "))))
+lw <- min(detect_workers(), max(1L, n_link_urls))
+link_status <- with_cluster(lw, worker_init = worker_init, FUN = function(cl) {
+  check_mrf_links(results, cl)
+})
 if (nrow(link_status)) {
   fwrite(link_status, "./data/mrf_link_status.csv")
   message(sprintf(
@@ -362,3 +389,5 @@ if (nrow(link_status)) {
     sum(link_status$ok)
   ))
 }
+
+}  # end driver guard: if (sys.nframe() == 0)

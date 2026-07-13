@@ -56,6 +56,12 @@ setwd(find_project_root())
 if (!dir.exists("data"))
   stop("Run from project root (a 'data' dir must exist).")
 
+# Parallelism helpers. Sourcing this file only defines functions; the driver
+# (under `# ---- main`) is guarded by `if (sys.nframe() == 0)` so parallel
+# workers can source THIS script to get fetch_and_store_one() without launching
+# a second run.
+source(file.path("code", "_parallel_utils.R"))
+
 # ---- config -------------------------------------------------------------
 
 INPUT_RESULTS_CSV <- "./data/hpt_results.csv"
@@ -67,6 +73,20 @@ TMP_DIR           <- file.path(DATA_DIR, "tmp")
 
 SNAPSHOTS_CSV     <- file.path(MANIFEST_DIR, "mrf_snapshots.csv")
 URL_MAP_CSV       <- file.path(MANIFEST_DIR, "url_hospital_map.csv")
+
+# Canonical manifest schema. EVERY row ever written to SNAPSHOTS_CSV must have
+# exactly these columns, in this order. `fwrite(append=TRUE)` does NOT verify
+# that new rows match the existing header -- so if this vector ever changes,
+# appending would leave the file with a mix of column counts. A reader like
+# data.table::fread then locks onto the (narrower) header width and STOPS EARLY
+# at the first wider row, silently truncating the manifest. `read_snapshots()`
+# below reads defensively against that, and the writer migrates the file to
+# this schema before appending. If you add a column, add it HERE (and to the
+# `base_row` in fetch_and_store_one) and old files auto-migrate on next run.
+SNAPSHOT_COLS <- c(
+  "run_date", "url", "http_status", "outcome", "content_hash",
+  "storage_path", "bytes_raw", "detected_format", "content_type"
+)
 
 USER_AGENT   <-
   "price-transparency-research/0.1 (contact: research)"
@@ -90,6 +110,86 @@ for (d in c(BLOB_DIR, ETAG_DIR, MANIFEST_DIR, TMP_DIR)) {
 log_msg <-
   function(...)
     message(sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+
+# Read the append-only manifest defensively. The file may contain rows with
+# FEWER columns than SNAPSHOT_COLS (written before a column was added). A plain
+# fread() stops early at the first row wider than the header, silently dropping
+# most of the history; we instead force fread to use the full canonical width by
+# supplying our own header, then coerce each row to SNAPSHOT_COLS. Rows that are
+# short (old schema) get NA in the trailing columns; rows that are long (should
+# not happen, but be safe) keep only the leading canonical columns. Returns an
+# empty, correctly-typed data.table when the file is absent.
+read_snapshots <- function(path = SNAPSHOTS_CSV) {
+  if (!file.exists(path))
+    return(setNames(
+      data.table(matrix(character(0), ncol = length(SNAPSHOT_COLS))),
+      SNAPSHOT_COLS
+    ))
+  lines <- readLines(path, warn = FALSE)
+  lines <- lines[nzchar(lines)]
+  if (length(lines) <= 1L)  # header only (or empty)
+    return(setNames(
+      data.table(matrix(character(0), ncol = length(SNAPSHOT_COLS))),
+      SNAPSHOT_COLS
+    ))
+  # Replace whatever header is on disk with the canonical (widest) one so fread
+  # allocates all columns and never truncates at a wider data row.
+  body <- lines[-1L]
+  dt <- fread(
+    text = c(paste(SNAPSHOT_COLS, collapse = ","), body),
+    header = TRUE,
+    fill = TRUE,
+    colClasses = "character"
+  )
+  # Guarantee exactly the canonical columns in order (add missing as NA).
+  for (col in SNAPSHOT_COLS)
+    if (!col %in% names(dt))
+      dt[, (col) := NA_character_]
+  dt <- dt[, ..SNAPSHOT_COLS]
+  # restore the numeric type of columns that downstream code treats as numbers
+  suppressWarnings({
+    dt[, http_status := as.integer(http_status)]
+    dt[, bytes_raw   := as.numeric(bytes_raw)]
+  })
+  dt
+}
+
+# Append run rows to the manifest, keeping the on-disk file at the canonical
+# schema. If the existing file has a stale (narrower) header, migrate it in
+# place first -- re-read every row through read_snapshots(), rewrite the whole
+# file with the canonical header, THEN append -- so the manifest never contains
+# a mix of column widths again.
+write_snapshots <- function(new_rows, path = SNAPSHOTS_CSV) {
+  # normalize the new rows to the canonical column set/order
+  new_rows <- as.data.table(new_rows)
+  for (col in SNAPSHOT_COLS)
+    if (!col %in% names(new_rows))
+      new_rows[, (col) := NA]
+  new_rows <- new_rows[, ..SNAPSHOT_COLS]
+
+  if (!file.exists(path)) {
+    fwrite(new_rows, path)
+    return(invisible())
+  }
+  hdr <- tryCatch(readLines(path, n = 1L, warn = FALSE), error = function(e) "")
+  hdr_cols <- if (length(hdr) && nzchar(hdr))
+    strsplit(hdr, ",", fixed = TRUE)[[1]]
+  else
+    character(0)
+  header_is_canonical <- identical(hdr_cols, SNAPSHOT_COLS)
+
+  if (header_is_canonical) {
+    fwrite(new_rows, path, append = TRUE)
+  } else {
+    # migrate: rebuild the whole file at the canonical schema, then append
+    log_msg("Manifest header is stale (%d cols); migrating to canonical %d-col schema.",
+            length(hdr_cols), length(SNAPSHOT_COLS))
+    existing <- read_snapshots(path)
+    combined <- rbindlist(list(existing, new_rows), fill = TRUE)[, ..SNAPSHOT_COLS]
+    fwrite(combined, path)  # overwrite with canonical header + all rows
+  }
+  invisible()
+}
 
 url_key <- function(url)
   digest::digest(url, algo = "sha256")
@@ -226,11 +326,11 @@ load_latest_state <- function() {
     bytes_raw = numeric(),
     detected_format = character()
   )
-  if (!file.exists(SNAPSHOTS_CSV))
+  # read_snapshots() reads the full manifest defensively (never truncates at a
+  # schema-width change) and always returns the canonical columns.
+  hist <- read_snapshots()
+  if (nrow(hist) == 0)
     return(empty)
-  hist <- fread(SNAPSHOTS_CSV)
-  if (!"detected_format" %in% names(hist))
-    hist[, detected_format := NA_character_]
   setorder(hist, url, run_date)
   hist[, .SD[.N], by = url][, .(url, content_hash, storage_path, bytes_raw, detected_format)]
 }
@@ -367,6 +467,8 @@ fetch_and_store_one <- function(url, prior) {
 
 # ---- main -----------------------------------------------------------------
 
+if (sys.nframe() == 0) {   # driver: skipped when sourced by a parallel worker
+
 stopifnot(file.exists(INPUT_RESULTS_CSV))
 url_map <- load_url_hospital_map(INPUT_RESULTS_CSV)
 fwrite(url_map, URL_MAP_CSV)
@@ -381,22 +483,36 @@ log_msg(
 latest_state <- load_latest_state()
 setkey(latest_state, url)
 
-rows <- vector("list", length(unique_urls))
-for (i in seq_along(unique_urls)) {
-  u <- unique_urls[i]
-  prior <-
-    if (u %in% latest_state$url)
-      as.list(latest_state[u])
-  else
-    NULL
-  rows[[i]] <- fetch_and_store_one(u, prior)
-  if (i %% 25 == 0)
-    log_msg("...%d / %d urls checked", i, length(unique_urls))
-  Sys.sleep(POLITE_SLEEP)
-}
+# Precompute each URL's prior state HERE (latest_state lives only in the main
+# process); hand each worker a self-contained (url, prior) pair. Fetches
+# parallelize across hosts, stay serial + POLITE_SLEEP-spaced within a host --
+# so any single hospital server sees at most one in-flight request. The blob
+# store and etag/tmp paths are content-/url-hash addressed, so concurrent
+# workers never collide on a write.
+work <- lapply(unique_urls, function(u) {
+  prior <- if (u %in% latest_state$url) as.list(latest_state[u]) else NULL
+  list(url = u, prior = prior)
+})
+
+n_workers <- min(detect_workers(), max(1L, length(unique_urls)))
+log_msg("Fetching %d unique URLs with %d worker(s) (PIPELINE_WORKERS overrides).",
+        length(unique_urls), n_workers)
+worker_init <- local({
+  root <- getwd()
+  function() { setwd(root); source(file.path("code", "02_mrf_fetch_and_store.R")) }
+})
+rows <- with_cluster(n_workers, worker_init = worker_init, FUN = function(cl) {
+  par_by_host(cl, work, unique_urls,
+              function(w) fetch_and_store_one(w$url, w$prior), sleep = POLITE_SLEEP)
+})
 run_results <- rbindlist(rows, fill = TRUE)
 
-fwrite(run_results, SNAPSHOTS_CSV, append = file.exists(SNAPSHOTS_CSV))
+# Append via write_snapshots() (not a bare fwrite append): it normalizes rows to
+# the canonical schema and, if the on-disk file has a stale/narrower header,
+# migrates the whole file to the canonical schema before appending -- so the
+# manifest never ends up with a mix of column widths that a later fread would
+# truncate at.
+write_snapshots(run_results, SNAPSHOTS_CSV)
 
 tab <- table(run_results$outcome)
 log_msg("Run complete. Outcomes: %s", paste(sprintf("%s=%d", names(tab), tab), collapse = ", "))
@@ -413,4 +529,6 @@ log_msg(
   blob_bytes / 1e6,
   length(list.files(BLOB_DIR, recursive = TRUE))
 )
-log_msg("Total (url x run) manifest rows so far: %d", nrow(fread(SNAPSHOTS_CSV)))
+log_msg("Total (url x run) manifest rows so far: %d", nrow(read_snapshots()))
+
+}  # end driver guard: if (sys.nframe() == 0)
