@@ -180,7 +180,13 @@ if (nrow(todo)) {
         } else if (isTRUE(res$skipped_too_large)) {
           newly_skipped <<- c(newly_skipped, res$content_hash)
         }
+        # Force cleanup of tmp dir if the process shut down
+        tmp_files <- list.files(TMP_DIR, full.names = TRUE, recursive = TRUE)
+        if (length(tmp_files) > 0) {
+          unlink(tmp_files, recursive = TRUE)
+        }
       }
+  
       done_count <- done_count + length(ch)
       log_msg("...%d / %d blobs processed", done_count, nrow(todo))
       flush_progress(all_logs, newly_done, newly_skipped)
