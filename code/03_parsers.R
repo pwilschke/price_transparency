@@ -21,6 +21,7 @@ library(data.table)
 library(stringr)
 library(arrow)
 library(jsonlite)
+.HAVE_CALLR <- requireNamespace("callr", quietly = TRUE)
 
 # ---- config (paths + shared schema constants used by the parsers) ---------
 
@@ -33,6 +34,47 @@ TMP_DIR       <- file.path(DATA_DIR, "tmp")
 if (!dir.exists(TMP_DIR)) dir.create(TMP_DIR, recursive = TRUE)
 
 log_msg <- function(...) message(sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+
+# ---- size gating -----------------------------------------------------------
+# Some hospital MRFs are enormous (multi-GB uncompressed), and fully
+# materializing one in R -- especially JSON, which becomes a deeply nested list
+# with substantial per-object overhead -- can exhaust available memory and crash
+# the whole R session rather than raising a catchable error. Estimate the likely
+# in-memory footprint BEFORE attempting to read/parse, and skip (log, don't
+# crash) anything over the configured ceiling. Tune MAX_ESTIMATED_MB against
+# your actual available RAM; JSON in particular can expand well beyond its
+# uncompressed byte count once parsed into nested R list objects, so treat this
+# ceiling as conservative, not exact -- it's sized to the on-disk/uncompressed
+# footprint, not the eventual R object size.
+MAX_ESTIMATED_MB     <- 1500  # skip (log, don't attempt) anything estimated above this
+GZIP_EXPANSION_GUESS <- 8     # typical text-compression ratio for repetitive CSV/JSON
+ZIP_EXPANSION_GUESS  <- 8     # fallback only, used if the zip's own listing can't be read
+
+# Estimate a blob's uncompressed size in MB. The manifest already recorded the
+# TRUE uncompressed size at fetch time (bytes_raw, measured before gzip
+# compression) -- use that directly when present, since it's exact rather than
+# a guess. Only fall back to inferring from the on-disk (possibly compressed)
+# blob when bytes_raw is missing (e.g. an older manifest row from before that
+# field existed). For a zip, the container's own directory listing gives the
+# TRUE uncompressed size of each member for free. For gzip, there's no equally
+# cheap trick (the trailing ISIZE field wraps at 4GB and can't be trusted for
+# large files), so that fallback path uses a fixed expansion multiplier.
+estimate_uncompressed_mb <- function(mrow) {
+  if (!is.null(mrow$bytes_raw) && length(mrow$bytes_raw) == 1 &&
+      !is.na(mrow$bytes_raw) && mrow$bytes_raw > 0) {
+    return(as.numeric(mrow$bytes_raw) / 1e6)
+  }
+  storage_path <- mrow$storage_path
+  on_disk_mb <- file.size(storage_path) / 1e6
+  ext <- tolower(storage_path)
+  if (str_detect(ext, "\\.zip$")) {
+    members <- tryCatch(utils::unzip(storage_path, list = TRUE), error = function(e) NULL)
+    if (!is.null(members) && nrow(members)) return(sum(members$Length) / 1e6)
+    return(on_disk_mb * ZIP_EXPANSION_GUESS)
+  }
+  if (str_detect(ext, "\\.gz$")) return(on_disk_mb * GZIP_EXPANSION_GUESS)
+  on_disk_mb
+}
 
 # Canonical output column order. Every parser is passed through ensure_schema()
 # so the parquet dataset has one stable schema regardless of source format.
@@ -61,8 +103,6 @@ UNIFIED_COLS <- c(
 
 # ---- value coercion -------------------------------------------------------
 
-# Vectorized numeric coercion. Strips $ , and whitespace. Returns value / raw /
-# ok. ok is FALSE only when a non-blank string fails to parse (blanks are fine).
 coerce_numeric_vec <- function(x) {
   raw     <- as.character(x)
   trimmed <- str_trim(raw)
@@ -75,8 +115,6 @@ coerce_numeric_vec <- function(x) {
   list(value = val, raw = raw, ok = ok)
 }
 
-# ISO 8601 preferred; CMS also allows M/D/YYYY and MM/DD/YYYY. Returns an ISO
-# string, or the original text if nothing parses (never silently blanked).
 coerce_date <- function(x) {
   if (is.null(x) || length(x) == 0) return(NA_character_)
   s <- str_trim(as.character(x)[1])
@@ -88,7 +126,6 @@ coerce_date <- function(x) {
   s
 }
 
-# Split a pipe-delimited scalar (CMS packs multi-valued metadata this way).
 split_pipe <- function(x) {
   if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) return(character(0))
   str_trim(str_split(as.character(x), "\\|")[[1]])
@@ -96,21 +133,17 @@ split_pipe <- function(x) {
 
 # ---- blob reading (handle .gz / .zip / plain) -----------------------------
 
-# Sniff whether a decompressed file is json or csv from its first real byte,
-# ignoring the (often lying) extension.
 sniff_text_format <- function(path) {
   con <- file(path, "rb"); on.exit(close(con), add = TRUE)
   b <- as.integer(readBin(con, "raw", n = 64L))
   if (length(b) == 0) return("empty")
   i <- 1L
-  if (length(b) >= 3 && b[1] == 0xEF && b[2] == 0xBB && b[3] == 0xBF) i <- 4L  # BOM
+  if (length(b) >= 3 && b[1] == 0xEF && b[2] == 0xBB && b[3] == 0xBF) i <- 4L
   while (i <= length(b) && b[i] %in% c(0x20, 0x09, 0x0A, 0x0D)) i <- i + 1L
   if (i <= length(b) && b[i] %in% c(0x7B, 0x5B)) return("json")
   "csv"
 }
 
-# Return one or more readable plain files for a stored blob. A zip may hold
-# several members; each becomes its own logical file. Caller unlinks temps.
 read_blob_members <- function(storage_path) {
   ext <- tolower(storage_path)
   if (!dir.exists(TMP_DIR)) dir.create(TMP_DIR, recursive = TRUE)
@@ -118,7 +151,7 @@ read_blob_members <- function(storage_path) {
   if (str_detect(ext, "\\.zip$")) {
     members <- tryCatch(utils::unzip(storage_path, list = TRUE), error = function(e) NULL)
     if (is.null(members) || nrow(members) == 0) return(list())
-    members <- members[members$Length > 0, , drop = FALSE]   # drop dir entries
+    members <- members[members$Length > 0, , drop = FALSE]
     out <- list()
     for (nm in members$Name) {
       dest <- tempfile(tmpdir = TMP_DIR)
@@ -140,14 +173,11 @@ read_blob_members <- function(storage_path) {
     return(list(list(path = dest, member = NA_character_, is_temp = TRUE)))
   }
   
-  # plain
   list(list(path = storage_path, member = NA_character_, is_temp = FALSE))
 }
 
 # ---- CSV metadata (rows 1-2) ----------------------------------------------
 
-# Read row 1 (metadata header) and row 2 (metadata values), map by header text
-# so we tolerate extra optional columns. Returns a one-row list of meta fields.
 parse_metadata_csv <- function(path) {
   hdr <- tryCatch(as.character(unlist(fread(path, sep = ",", nrows = 1, header = FALSE, fill = TRUE, colClasses = "character"))),
                   error = function(e) character(0))
@@ -159,7 +189,6 @@ parse_metadata_csv <- function(path) {
     i <- which(h == name)
     if (length(i) && i[1] <= length(val)) str_trim(val[i[1]]) else NA_character_
   }
-  # license header looks like "license_number|[state]" or "license_number|CA"
   lic_i     <- which(str_detect(h, "^license_number\\|"))
   lic_state <- if (length(lic_i)) toupper(str_trim(str_split(hdr[lic_i[1]], "\\|")[[1]][2])) else NA_character_
   lic_state <- if (!is.na(lic_state)) str_replace_all(lic_state, "[\\[\\]]", "") else NA_character_
@@ -182,16 +211,6 @@ parse_metadata_csv <- function(path) {
 
 # ---- shared helpers for the parsers ---------------------------------------
 
-# Gather the code|i / code|i|type column families into list columns + a scalar
-# primary (first non-blank) code/type. Operates on a data.table `dt`.
-#
-# Vectorized: instead of looping over every row in R (which was ~60s / 500k rows
-# and is the dominant cost of CSV parsing on large files), stack the code|i and
-# code|i|type columns into long (rid, slot, code, type) vectors, drop blanks in
-# one shot, then rebuild the per-row list columns with a single by-rid split.
-# Output is byte-identical to the previous row loop, including the per-slot
-# handling of a missing code|i|type column (that slot's type is NA) and code
-# families given out of numeric order.
 gather_codes <- function(dt) {
   nm         <- names(dt)
   code_cols  <- nm[str_detect(nm, "^code\\|\\d+$")]
@@ -200,46 +219,37 @@ gather_codes <- function(dt) {
     return(list(codes = rep(list(character(0)), n), code_types = rep(list(character(0)), n),
                 primary_code = rep(NA_character_, n), primary_code_type = rep(NA_character_, n)))
   }
-  # order by the numeric index so primary = code|1 when present
   code_cols  <- code_cols[order(as.integer(str_extract(code_cols, "\\d+")))]
   type_cols  <- paste0(code_cols, "|type")
   nc <- length(code_cols)
-
-  # Stack slot-major: column j contributes rows (1..n) at slot j. A type column
-  # that doesn't exist contributes NA for that whole slot (matches old semantics).
+  
   code_v <- str_trim(unlist(lapply(code_cols, function(cc) as.character(dt[[cc]])), use.names = FALSE))
   type_v <- str_trim(unlist(lapply(type_cols, function(tc)
     if (tc %in% nm) as.character(dt[[tc]]) else rep(NA_character_, n)), use.names = FALSE))
   rid  <- rep.int(seq_len(n), nc)
   slot <- rep(seq_len(nc), each = n)
-
+  
   keep <- !is.na(code_v) & nzchar(code_v)
   L <- data.table(rid = rid[keep], slot = slot[keep], code = code_v[keep], type = type_v[keep])
   setorder(L, rid, slot)
-
+  
   codes <- rep(list(character(0)), n); ctypes <- rep(list(character(0)), n)
   pcode <- rep(NA_character_, n); ptype <- rep(NA_character_, n)
   if (nrow(L)) {
     cby <- L[, .(v = list(code)), by = rid]; codes[cby$rid]  <- cby$v
     tby <- L[, .(v = list(type)), by = rid]; ctypes[tby$rid] <- tby$v
-    prim <- L[, .SD[1], by = rid]           # first slot per row = primary
+    prim <- L[, .SD[1], by = rid]
     pcode[prim$rid] <- prim$code; ptype[prim$rid] <- prim$type
   }
   list(codes = codes, code_types = ctypes, primary_code = pcode, primary_code_type = ptype)
 }
 
-# Column types for the unified schema. Everything not listed here is character.
-# Enforcing this on EVERY parser output guarantees all parquet files share one
-# schema, so arrow::open_dataset() can read them together (an all-NA column in
-# one file would otherwise infer as logical and clash with double elsewhere).
 LIST_COLS    <- c("type_2_npi", "location_name", "hospital_address", "codes", "code_types", "modifiers")
 NUMERIC_COLS <- c("standard_charge_gross", "standard_charge_discounted_cash",
                   "standard_charge_min", "standard_charge_max",
                   "negotiated_dollar", "negotiated_percentage",
                   "median_amount", "p10_percentile", "p90_percentile")
 
-# Ensure a data.table has exactly UNIFIED_COLS, in order, each with its
-# canonical type (missing -> typed NA / empty list).
 ensure_schema <- function(dt) {
   dt <- as.data.table(dt)
   n <- nrow(dt)
@@ -262,7 +272,6 @@ ensure_schema <- function(dt) {
   dt[, ..UNIFIED_COLS]
 }
 
-# Attach file-level metadata (list-valued fields repeated as list columns).
 attach_meta <- function(dt, meta, prov) {
   n <- nrow(dt)
   if (n == 0) return(dt)
@@ -287,7 +296,6 @@ detect_type <- function(path) {
   if (fmt == "empty") return("noncompliant")
   if (fmt == "json")  return("json")
   
-  # csv: the DATA header is row 3
   hdr <- tryCatch(names(fread(path, sep = ",", skip = 2, nrows = 0, fill = TRUE)),
                   error = function(e) character(0))
   if (length(hdr) == 0) return("noncompliant")
@@ -299,7 +307,7 @@ detect_type <- function(path) {
   
   if (is_tall) return("tall_csv")
   if (is_wide) return("wide_csv")
-  if (has_gross && "description" %in% h) return("tall_csv")  # item-level only, no payer cols
+  if (has_gross && "description" %in% h) return("tall_csv")
   "noncompliant"
 }
 
@@ -355,7 +363,6 @@ parse_tall_csv <- function(path, meta, prov) {
   ok <- ok & add_and_set("standard_charge_max_src",             "standard_charge_max")
   ok <- ok & add_and_set("negotiated_dollar_src",               "negotiated_dollar")
   ok <- ok & add_and_set("negotiated_percentage_src",           "negotiated_percentage")
-  # percentile / median: numeric, no raw kept
   set_num_noraw <- function(src, dst) {
     if (src %in% names(dt)) { c3 <- coerce_numeric_vec(dt[[src]]); out[, (dst) := c3$value]; return(c3$ok) }
     out[, (dst) := NA_real_]; rep(TRUE, nrow(out))
@@ -372,8 +379,6 @@ parse_tall_csv <- function(path, meta, prov) {
 
 # ---- parse_wide_csv -------------------------------------------------------
 
-# Parse a wide payer column name into (payer, plan, field) or NULL if it is an
-# item-level column.
 parse_payer_col <- function(cn) {
   parts <- str_trim(str_split(cn, "\\|")[[1]])
   n <- length(parts)
@@ -407,7 +412,6 @@ parse_wide_csv <- function(path, meta, prov) {
   setnames(dt, names(dt), str_trim(names(dt)))
   dt[, .rid := .I]
   
-  # --- item-level table (one row per item) ---
   cg <- gather_codes(dt)
   item <- data.table(.rid = dt$.rid,
                      description = if ("description" %in% names(dt)) dt$description else NA_character_,
@@ -432,7 +436,6 @@ parse_wide_csv <- function(path, meta, prov) {
   item_ok <- item_ok & add_item("standard_charge|max",             "standard_charge_max")
   item[, item_ok := item_ok]
   
-  # --- payer column groups ---
   payer_map <- Filter(Negate(is.null), setNames(lapply(names(dt), parse_payer_col), names(dt)))
   long_list <- list()
   if (length(payer_map)) {
@@ -448,7 +451,7 @@ parse_wide_csv <- function(path, meta, prov) {
           c3 <- coerce_numeric_vec(dt[[cn]]); g[, (fld) := c3$value]; g[, (paste0(fld, "_raw")) := c3$raw]; g_ok <- g_ok & c3$ok
         } else if (fld %in% c("median_amount", "p10_percentile", "p90_percentile")) {
           c3 <- coerce_numeric_vec(dt[[cn]]); g[, (fld) := c3$value]; g_ok <- g_ok & c3$ok
-        } else {  # negotiated_algorithm, methodology, count, additional_payer_notes -> string
+        } else {
           g[, (fld) := str_trim(as.character(dt[[cn]]))]
         }
       }
@@ -476,7 +479,6 @@ parse_wide_csv <- function(path, meta, prov) {
     base      <- item
   }
   out <- rbindlist(list(res_payer, base), fill = TRUE)
-  # fold ok flags
   po <- rep(TRUE, nrow(out))
   if ("item_ok" %in% names(out))  po <- po & (is.na(out$item_ok)  | out$item_ok)
   if ("payer_ok" %in% names(out)) po <- po & (is.na(out$payer_ok) | out$payer_ok)
@@ -486,15 +488,8 @@ parse_wide_csv <- function(path, meta, prov) {
   ensure_schema(out)
 }
 
-
 # ---- parse_json -----------------------------------------------------------
 
-# Read a JSON MRF into a nested list. RcppSimdJson is dramatically faster than
-# jsonlite on the large files these can be, so prefer it -- but do NOT fall back
-# silently: a silent drop to jsonlite (e.g. the package failing to load) turned
-# a fast path into a multi-day one with no visible signal. Detect availability
-# once; if the fast read errors on a specific file, log a warning naming the
-# file before falling back so a systematic regression is obvious.
 .HAVE_SIMDJSON <- requireNamespace("RcppSimdJson", quietly = TRUE)
 
 read_json_root <- function(path) {
@@ -517,7 +512,7 @@ read_json_root <- function(path) {
 
 parse_json <- function(path, prov) {
   root <- read_json_root(path)
-
+  
   g  <- function(x, k) { v <- x[[k]]; if (is.null(v)) NA else v }
   ga <- function(x, k) { v <- x[[k]]; if (is.null(v)) list() else v }
   chr1 <- function(v) if (is.null(v)) NA_character_ else as.character(v[1])
@@ -528,14 +523,13 @@ parse_json <- function(path, prov) {
     vv <- suppressWarnings(as.numeric(v))
     list(value = vv, ok = !is.na(vv))
   }
-  # numeric getter that returns just the value (for vectorized payer blocks)
   numv <- function(v) {
     if (is.null(v)) return(NA_real_)
     if (length(v) > 1) v <- v[1]
     if (is.na(v)) return(NA_real_)
     suppressWarnings(as.numeric(v))
   }
-
+  
   npis <- unlist(ga(root, "type_2_npi"))
   meta <- list(
     hospital_name    = as.character(g(root, "hospital_name")),
@@ -549,27 +543,21 @@ parse_json <- function(path, prov) {
     license_state    = as.character(g(root[["license_information"]], "state")),
     attester_name    = as.character(g(root[["attestation"]], "attester_name"))
   )
-
+  
   sci <- ga(root, "standard_charge_information")
-
-  # ---- pass 1: count exactly how many output rows we need, so every output
-  # column can be a single preallocated vector we fill by slice assignment. The
-  # previous version built a fresh list per payer row (c(base, list(...))),
-  # copying the 14 invariant "base" fields for every payer; filling typed
-  # columns in place avoids that per-row allocation entirely.
+  
   n_total <- 0L
   for (item in sci) {
     for (sc in ga(item, "standard_charges")) {
       n_total <- n_total + max(length(ga(sc, "payers_information")), 1L)
     }
   }
-
+  
   if (n_total == 0L) {
     out <- attach_meta(data.table(), meta, prov)
     return(ensure_schema(out))
   }
-
-  # preallocate output columns
+  
   NA_c <- rep(NA_character_, n_total); NA_r <- rep(NA_real_, n_total)
   col <- list(
     description = NA_c, primary_code = NA_c, primary_code_type = NA_c,
@@ -587,7 +575,7 @@ parse_json <- function(path, prov) {
   codes_col <- vector("list", n_total)
   ctypes_col <- vector("list", n_total)
   modifiers_col <- vector("list", n_total)
-
+  
   k <- 0L
   for (item in sci) {
     desc     <- as.character(g(item, "description"))
@@ -599,7 +587,7 @@ parse_json <- function(path, prov) {
     drug   <- item[["drug_information"]]
     d_unit <- if (is.null(drug)) NA_character_ else chr1(drug[["unit"]])
     d_type <- if (is.null(drug)) NA_character_ else chr1(drug[["type"]])
-
+    
     for (sc in ga(item, "standard_charges")) {
       gross <- num(g(sc, "gross_charge")); cash <- num(g(sc, "discounted_cash"))
       mn    <- num(g(sc, "minimum"));      mx   <- num(g(sc, "maximum"))
@@ -607,13 +595,12 @@ parse_json <- function(path, prov) {
       mods    <- as.character(unlist(ga(sc, "modifier_code")))
       sc_set  <- chr1(sc[["setting"]])
       sc_note <- chr1(sc[["additional_generic_notes"]])
-
+      
       payers <- ga(sc, "payers_information")
       np     <- length(payers)
-      m      <- max(np, 1L)          # rows this standard_charge entry contributes
-      idx    <- (k + 1L):(k + m)     # slice of the output it fills
-
-      # item-level fields: identical across all payer rows for this entry
+      m      <- max(np, 1L)
+      idx    <- (k + 1L):(k + m)
+      
       col$description[idx]       <- desc
       col$primary_code[idx]      <- p_code
       col$primary_code_type[idx] <- p_type
@@ -626,21 +613,20 @@ parse_json <- function(path, prov) {
       col$standard_charge_max[idx]             <- mx$value
       col$additional_generic_notes[idx]        <- sc_note
       for (jj in idx) { codes_col[[jj]] <- codes; ctypes_col[[jj]] <- ctypes; modifiers_col[[jj]] <- mods }
-
+      
       if (np == 0L) {
         col$parse_ok[idx] <- item_ok
         k <- k + 1L
         next
       }
-
-      # payer-level fields: one value per payer, assigned as a block
+      
       col$payer_name[idx]           <- vapply(payers, function(p) chr1(p[["payer_name"]]), character(1))
       col$plan_name[idx]            <- vapply(payers, function(p) chr1(p[["plan_name"]]), character(1))
       col$negotiated_algorithm[idx] <- vapply(payers, function(p) chr1(p[["standard_charge_algorithm"]]), character(1))
       col$methodology[idx]          <- vapply(payers, function(p) chr1(p[["methodology"]]), character(1))
       col$count[idx]                <- vapply(payers, function(p) chr1(p[["count"]]), character(1))
       col$additional_payer_notes[idx] <- vapply(payers, function(p) chr1(p[["additional_payer_notes"]]), character(1))
-
+      
       nd  <- vapply(payers, function(p) numv(p[["standard_charge_dollar"]]), numeric(1))
       npc <- vapply(payers, function(p) numv(p[["standard_charge_percentage"]]), numeric(1))
       col$negotiated_dollar[idx]     <- nd
@@ -648,20 +634,17 @@ parse_json <- function(path, prov) {
       col$median_amount[idx]  <- vapply(payers, function(p) numv(p[["median_amount"]]), numeric(1))
       col$p10_percentile[idx] <- vapply(payers, function(p) numv(p[["10th_percentile"]]), numeric(1))
       col$p90_percentile[idx] <- vapply(payers, function(p) numv(p[["90th_percentile"]]), numeric(1))
-
-      # parse_ok mirrors the old per-row rule: item numerics ok AND this payer's
-      # dollar & percentage both parsed (blank -> NA -> ok). A blank/NA source is
-      # "ok"; only a non-blank string that fails to coerce is not.
+      
       nd_raw  <- lapply(payers, function(p) p[["standard_charge_dollar"]])
       npc_raw <- lapply(payers, function(p) p[["standard_charge_percentage"]])
       nd_ok  <- vapply(seq_len(np), function(j) { v <- nd_raw[[j]];  is.null(v) || is.na(v[1]) || !is.na(nd[j]) },  logical(1))
       npc_ok <- vapply(seq_len(np), function(j) { v <- npc_raw[[j]]; is.null(v) || is.na(v[1]) || !is.na(npc[j]) }, logical(1))
       col$parse_ok[idx] <- item_ok & nd_ok & npc_ok
-
+      
       k <- k + np
     }
   }
-
+  
   out <- as.data.table(col)
   out[, codes := codes_col][, code_types := ctypes_col][, modifiers := modifiers_col]
   out <- attach_meta(out, meta, prov)
@@ -670,8 +653,6 @@ parse_json <- function(path, prov) {
 
 # ---- process_blob ---------------------------------------------------------
 
-# Convert one manifest row (one content hash / storage path) into unified rows.
-# Returns list(data = <DT or NULL>, log = <DT of per-logical-file outcomes>).
 process_blob <- function(mrow) {
   members <- tryCatch(read_blob_members(mrow$storage_path), error = function(e) list())
   if (length(members) == 0) {
@@ -691,7 +672,7 @@ process_blob <- function(mrow) {
       else if (kind == "wide_csv") { parse_wide_csv(m$path, parse_metadata_csv(m$path), prov) }
       else { reason <- "does not match CMS tall/wide/json"; NULL }
     }, error = function(e) { reason <<- paste("parse error:", conditionMessage(e)); NULL })
-
+    
     if (!is.null(dt) && nrow(dt)) data_parts[[length(data_parts) + 1]] <- dt
     logs[[length(logs) + 1]] <- data.table(content_hash = mrow$content_hash,
                                            storage_path = mrow$storage_path, member = m$member, detected = kind,
@@ -702,26 +683,97 @@ process_blob <- function(mrow) {
        log  = rbindlist(logs, fill = TRUE))
 }
 
-# Parse ONE blob and write its parquet output, returning only small metadata.
-# This is the unit of work handed to each parallel worker: it does both the CPU
-# work (process_blob) and the write, so the large parsed data.table never has to
-# be serialized back to the main process (which for million-row blobs would cost
-# far more than the parse itself). Each blob writes its own content_hash-prefixed
-# parquet file, so concurrent writers never target the same file.
-#
-# Returns list(content_hash, n_rows, wrote (logical), log (data.table)).
-process_and_write_blob <- function(mrow) {
+# Shared size-gate check. Returns NULL if the blob should proceed, or a
+# fully-formed result list (to return immediately) if it should be skipped.
+check_size_gate <- function(mrow) {
+  est_mb <- tryCatch(estimate_uncompressed_mb(mrow), error = function(e) NA_real_)
+  if (!is.na(est_mb) && est_mb > MAX_ESTIMATED_MB) {
+    log <- data.table(
+      content_hash = mrow$content_hash, storage_path = mrow$storage_path,
+      member = NA_character_, detected = "skipped_too_large", n_rows = 0L,
+      reason = sprintf("estimated ~%.0f MB uncompressed exceeds MAX_ESTIMATED_MB=%d",
+                       est_mb, MAX_ESTIMATED_MB)
+    )
+    return(list(content_hash = mrow$content_hash, n_rows = 0L, wrote = FALSE,
+                skipped_too_large = TRUE, log = log))
+  }
+  NULL
+}
+
+# The actual parse + write, with NO size check (caller's job). This is the
+# piece run inside an isolated subprocess by process_and_write_blob_isolated()
+# below, so a crash here only kills that subprocess, never the driver.
+process_blob_and_write_core <- function(mrow) {
   r <- process_blob(mrow)
   wrote <- FALSE; n_rows <- 0L
   if (!is.null(r$data) && nrow(r$data)) {
     n_rows <- nrow(r$data)
-    # Unique per-blob filename so two blobs sharing a run_date/npi partition
-    # don't clobber each other (default basename is always part-0.parquet).
     write_dataset(r$data, PARQUET_DIR, partitioning = c("run_date", "npi"),
                   format = "parquet",
                   basename_template = paste0(mrow$content_hash, "-part-{i}.parquet"),
                   existing_data_behavior = "overwrite")
     wrote <- TRUE
   }
-  list(content_hash = mrow$content_hash, n_rows = n_rows, wrote = wrote, log = r$log)
+  list(content_hash = mrow$content_hash, n_rows = n_rows, wrote = wrote,
+       skipped_too_large = FALSE, log = r$log)
+}
+
+# Non-isolated version: size gate + core, all in the calling process. Kept as
+# a fallback for when the `callr` package isn't installed -- no crash
+# protection, but otherwise identical.
+process_and_write_blob <- function(mrow) {
+  gate <- check_size_gate(mrow)
+  if (!is.null(gate)) return(gate)
+  process_blob_and_write_core(mrow)
+}
+
+# Isolated version: the size gate stays cheap and in-process (no need to pay
+# subprocess-spawn cost for a blob we're going to skip anyway), but the actual
+# parse runs in a disposable subprocess with a timeout. This is what actually
+# contains a crash: an R session dying from memory exhaustion, a native-code
+# segfault inside arrow/RcppSimdJson, or a genuine infinite loop on a
+# pathological file (e.g. a wide-format CSV with an extreme number of distinct
+# payer/plan columns -- size in bytes doesn't predict this kind of blowup,
+# since parse_wide_csv's cost scales with column cardinality, not file size).
+# tryCatch cannot catch any of these: a crashed session never returns control
+# to a tryCatch at all. A crash or timeout here is logged and the blob is
+# simply not marked done, so it will be retried (and, if it fails again,
+# logged again) on the next run rather than silently vanishing.
+BLOB_TIMEOUT_SECS <- 600  # kill a single blob's parse if it hangs this long
+
+process_and_write_blob_isolated <- function(mrow, root, timeout_secs = BLOB_TIMEOUT_SECS) {
+  gate <- check_size_gate(mrow)
+  if (!is.null(gate)) return(gate)
+  
+  if (!.HAVE_CALLR) {
+    log_msg("WARN: callr not installed; running blob %s WITHOUT crash isolation. Install callr (install.packages(\"callr\")) for crash containment.",
+            substr(mrow$content_hash, 1, 12))
+    return(process_blob_and_write_core(mrow))
+  }
+  
+  res <- tryCatch(
+    callr::r(
+      func = function(mrow, root) {
+        setwd(root)
+        source(file.path("code", "03_parsers.R"))
+        process_blob_and_write_core(mrow)
+      },
+      args = list(mrow = mrow, root = root),
+      timeout = timeout_secs
+    ),
+    error = function(e) {
+      log_msg("WARN: blob %s crashed or timed out in an isolated subprocess (%s)",
+              substr(mrow$content_hash, 1, 12), conditionMessage(e))
+      NULL
+    }
+  )
+  
+  if (is.null(res)) {
+    log <- data.table(content_hash = mrow$content_hash, storage_path = mrow$storage_path,
+                      member = NA_character_, detected = "crashed_or_timed_out", n_rows = 0L,
+                      reason = "subprocess crashed (likely memory exhaustion) or exceeded timeout")
+    return(list(content_hash = mrow$content_hash, n_rows = 0L, wrote = FALSE,
+                skipped_too_large = FALSE, log = log))
+  }
+  res
 }
