@@ -47,6 +47,7 @@ SNAPSHOTS_CSV     <- file.path(MANIFEST_DIR, "mrf_snapshots.csv")
 URL_MAP_CSV       <- file.path(MANIFEST_DIR, "url_hospital_map.csv")
 PARQUET_INDEX_CSV <- file.path(MANIFEST_DIR, "parquet_index.csv")
 SKIPPED_INDEX_CSV <- file.path(MANIFEST_DIR, "skipped_index.csv")
+CRASHED_INDEX_CSV <- file.path(MANIFEST_DIR, "crashed_index.csv")
 PROCESSING_LOG    <- file.path(MANIFEST_DIR, "processing_log.csv")
 
 SNAPSHOT_COLS <- c(
@@ -112,15 +113,17 @@ for (d in c(PARQUET_DIR, MANIFEST_DIR, TMP_DIR)) if (!dir.exists(d)) dir.create(
 blobs <- load_blobs_to_process()
 done    <- read_hash_index(PARQUET_INDEX_CSV)
 skipped <- read_hash_index(SKIPPED_INDEX_CSV)
-todo  <- blobs[!content_hash %in% union(done, skipped)]
-log_msg("Blobs total=%d, already converted=%d, already skipped-too-large=%d, to process=%d",
-        nrow(blobs), length(done), length(skipped), nrow(todo))
+crashed <- read_hash_index(CRASHED_INDEX_CSV)
+todo  <- blobs[!content_hash %in% union(union(done, skipped), crashed)]
+log_msg("Blobs total=%d, already converted=%d, already skipped-too-large=%d, already_crashed=%d, to process=%d",
+        nrow(blobs), length(done), length(skipped), length(crashed), nrow(todo))
 
 all_logs <- list(); newly_done <- character(0); newly_skipped <- character(0); total_rows <- 0L
+newly_crashed <- character(0)
 n_converted <- 0L
 CHECKPOINT_EVERY <- 25L
 
-flush_progress <- function(logs_acc, done_acc, skipped_acc) {
+flush_progress <- function(logs_acc, done_acc, skipped_acc, crashed_acc) {
   if (length(logs_acc)) {
     logdt <- rbindlist(logs_acc, fill = TRUE)
     logdt[, run_at := format(Sys.time(), "%Y-%m-%dT%H:%M:%S")]
@@ -135,6 +138,11 @@ flush_progress <- function(logs_acc, done_acc, skipped_acc) {
     idx <- data.table(content_hash = unique(skipped_acc),
                       skipped_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"))
     fwrite(idx, SKIPPED_INDEX_CSV, append = file.exists(SKIPPED_INDEX_CSV))
+  }
+  if (length(crashed_acc)) {
+    idx <- data.table(content_hash = unique(crashed_acc),
+                      crashed_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"))
+    fwrite(idx, CRASHED_INDEX_CSV, append = file.exists(CRASHED_INDEX_CSV))
   }
 }
 
@@ -179,6 +187,8 @@ if (nrow(todo)) {
           n_converted <<- n_converted + 1L
         } else if (isTRUE(res$skipped_too_large)) {
           newly_skipped <<- c(newly_skipped, res$content_hash)
+        } else if (isTRUE(res$crashed)) {
+          newly_crashed <<- c(newly_crashed, res$content_hash)
         }
         # Force cleanup of tmp dir if the process shut down
         tmp_files <- list.files(TMP_DIR, full.names = TRUE, recursive = TRUE)
@@ -189,12 +199,13 @@ if (nrow(todo)) {
   
       done_count <- done_count + length(ch)
       log_msg("...%d / %d blobs processed", done_count, nrow(todo))
-      flush_progress(all_logs, newly_done, newly_skipped)
+      flush_progress(all_logs, newly_done, newly_skipped, newly_crashed)
       all_logs <<- list(); newly_done <<- character(0); newly_skipped <<- character(0)
+      newly_crashed <<- character(0)
     }
   })
 }
-flush_progress(all_logs, newly_done, newly_skipped)
+flush_progress(all_logs, newly_done, newly_skipped, newly_crashed)
 
 logdt <- if (file.exists(PROCESSING_LOG)) {
   full <- fread(PROCESSING_LOG)
